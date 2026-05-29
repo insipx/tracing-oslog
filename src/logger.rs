@@ -97,16 +97,23 @@ where
 	S: Subscriber + for<'a> LookupSpan<'a>,
 {
 	fn on_new_span(&self, attrs: &Attributes, id: &Id, ctx: Context<S>) {
-		let span = ctx.span(id).expect("invalid span, this shouldn't happen");
+		let Some(span) = ctx.span(id) else {
+			return;
+		};
 		let mut extensions = span.extensions_mut();
 		if extensions.get_mut::<Activity>().is_none() {
 			let mut names = NAMES.get_or_init(Mutex::default).lock().unwrap();
 			let metadata = span.metadata();
 			let parent_activity = match span.parent() {
-				Some(parent) => **parent
-					.extensions()
-					.get::<Activity>()
-					.expect("parent span didn't contain activity wtf"),
+				Some(parent) => {
+					// if the parent span does not contain an activity (which it should)
+					// just set the activity to the current span and move on
+					if let Some(parent_activity) = parent.extensions().get::<Activity>() {
+						**parent_activity
+					} else {
+						addr_of_mut!(_os_activity_current)
+					}
+				}
 				None => addr_of_mut!(_os_activity_current),
 			};
 			let mut attributes = AttributeMap::default();
@@ -161,21 +168,19 @@ where
 		let message =
 			CString::new(message).expect("failed to convert formatted message to a C string");
 		if let Some(parent_id) = ctx.current_span().id() {
-			let span = ctx
-				.span(parent_id)
-				.expect("invalid span, this shouldn't happen");
-			let mut extensions = span.extensions_mut();
-			let activity = extensions
-				.get_mut::<Activity>()
-				.expect("span didn't contain activity wtf");
-
-			let raw_state = [0u64; 2usize];
-			unsafe {
-				let state: os_activity_scope_state_s = std::mem::transmute(raw_state);
-				let state: os_activity_scope_state_t = &state as *const _ as *mut _;
-				os_activity_scope_enter(**activity, state);
-				wrapped_os_log_with_type(self.logger, level, message.as_ptr());
-				os_activity_scope_leave(state);
+			if let Some(span) = ctx.span(parent_id) {
+				let mut extensions = span.extensions_mut();
+				// span didn't contain activity wtf ?
+				if let Some(activity) = extensions.get_mut::<Activity>() {
+					let raw_state = [0u64; 2usize];
+					unsafe {
+						let state: os_activity_scope_state_s = std::mem::transmute(raw_state);
+						let state: os_activity_scope_state_t = &state as *const _ as *mut _;
+						os_activity_scope_enter(**activity, state);
+						wrapped_os_log_with_type(self.logger, level, message.as_ptr());
+						os_activity_scope_leave(state);
+					}
+				}
 			}
 		} else {
 			unsafe { wrapped_os_log_with_type(self.logger, level, message.as_ptr()) };
@@ -187,11 +192,10 @@ where
 	fn on_exit(&self, _id: &Id, _ctx: Context<S>) {}
 
 	fn on_close(&self, id: Id, ctx: Context<S>) {
-		let span = ctx.span(&id).expect("invalid span, this shouldn't happen");
-		let mut extensions = span.extensions_mut();
-		extensions
-			.remove::<Activity>()
-			.expect("span didn't contain activity wtf");
+		if let Some(span) = ctx.span(&id) {
+			let mut extensions = span.extensions_mut();
+			let _ = extensions.remove::<Activity>();
+		}
 	}
 }
 
